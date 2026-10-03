@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"time"
+    "strings"
 
 	srt "github.com/datarhei/gosrt"
 )
@@ -88,21 +89,21 @@ func newSRTRelay(passphrase, streamID string) *srtRelay {
 }
 
 func (r *srtRelay) handleConnect(req srt.ConnRequest) srt.ConnType {
+	id := req.StreamId()
 	mode := srt.REJECT
-	if req.StreamId() == r.mediaStreamID || req.StreamId() == r.statsStreamID {
+	switch {
+	case id == r.mediaStreamID || id == r.statsStreamID:
 		mode = srt.SUBSCRIBE
-	} else if isLoopbackAddr(req.RemoteAddr()) && (r.streamID == "" || req.StreamId() == r.streamID) {
-		// The SRTLA component always forwards its reconstructed SRT packets to
-		// this listener through 127.0.0.1. Do not allow a public connection to
-		// become the publisher.
+	case strings.HasSuffix(id, "-client") || strings.HasSuffix(id, "-stats"):
+		log.Printf("Rejected SRT connection from %s: stream ID %q does not match %q / %q",
+			req.RemoteAddr(), id, r.mediaStreamID, r.statsStreamID)
+	case isLoopbackAddr(req.RemoteAddr()) && (r.streamID == "" || id == r.streamID):
 		mode = srt.PUBLISH
 	}
-
 	if mode == srt.REJECT || !r.authorize(req) {
 		log.Printf("Rejected SRT connection from %s", req.RemoteAddr())
 		return srt.REJECT
 	}
-
 	return mode
 }
 
