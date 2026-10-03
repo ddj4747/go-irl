@@ -31,6 +31,36 @@ type srtRelay struct {
 	publisherActive bool
 	publisher       srt.Conn
 	publisherGen    uint64
+	subscribers     int
+	statsClients    int
+}
+
+type relaySnapshot struct {
+	PublisherAddr string // empty when no publisher is connected
+	Stats         *srt.Statistics
+	Subscribers   int
+	StatsClients  int
+}
+
+// snapshot reports the relay's current publisher and client counts.
+func (r *srtRelay) snapshot() relaySnapshot {
+	r.mu.Lock()
+	snap := relaySnapshot{Subscribers: r.subscribers, StatsClients: r.statsClients}
+	publisher := r.publisher
+	r.mu.Unlock()
+
+	if publisher != nil {
+		snap.PublisherAddr = publisher.RemoteAddr().String()
+		snap.Stats = &srt.Statistics{}
+		publisher.Stats(snap.Stats)
+	}
+	return snap
+}
+
+func (r *srtRelay) addClients(counter *int, delta int) {
+	r.mu.Lock()
+	*counter += delta
+	r.mu.Unlock()
 }
 
 func downstreamMediaStreamID(streamID string) string {
@@ -66,8 +96,6 @@ func (r *srtRelay) handleConnect(req srt.ConnRequest) srt.ConnType {
 		// this listener through 127.0.0.1. Do not allow a public connection to
 		// become the publisher.
 		mode = srt.PUBLISH
-	} else if req.StreamId() == r.mediaStreamID || req.StreamId() == downstreamStatsStreamID {
-		mode = srt.SUBSCRIBE
 	}
 
 	if mode == srt.REJECT || !r.authorize(req) {
@@ -132,6 +160,8 @@ func (r *srtRelay) handleSubscribe(conn srt.Conn) {
 	r.mu.Unlock()
 
 	log.Printf("Downstream client connected from %s", conn.RemoteAddr())
+	r.addClients(&r.subscribers, 1)
+	defer r.addClients(&r.subscribers, -1)
 	err := channel.Subscribe(conn)
 	_ = conn.Close()
 	if err != nil {
@@ -141,6 +171,8 @@ func (r *srtRelay) handleSubscribe(conn srt.Conn) {
 
 func (r *srtRelay) handleStatsSubscribe(conn srt.Conn) {
 	log.Printf("Statistics client connected from %s", conn.RemoteAddr())
+	r.addClients(&r.statsClients, 1)
+	defer r.addClients(&r.statsClients, -1)
 	defer func() {
 		_ = conn.Close()
 		log.Printf("Statistics client disconnected from %s", conn.RemoteAddr())
@@ -176,6 +208,7 @@ func (r *srtRelay) handleStatsSubscribe(conn srt.Conn) {
 				Timestamp: time.Now(),
 				Type:      "reader",
 				Stats:     statistics,
+				Links:     srtlaLinks(),
 			}
 			var err error
 			payload, err = json.Marshal(message)
@@ -193,7 +226,7 @@ func (r *srtRelay) handleStatsSubscribe(conn srt.Conn) {
 }
 
 func (r *srtRelay) newServer(addr string) (*srt.Server, error) {
-	config := srt.DefaultConfig()
+	config := newSRTConfig()
 	server := &srt.Server{
 		Addr:            addr,
 		Config:          &config,

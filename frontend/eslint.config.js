@@ -25,4 +25,21 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // Replays files captured by the Go E2E suite, so it runs under Node.
+    files: ['e2e/**/*.{ts,tsx}'],
+    languageOptions: {
+      globals: { ...globals.browser, ...globals.node },
+    },
+  },
+  {
+    // Playwright fixtures take a `use` callback, which is not the React hook.
+    files: ['e2e/browser/**/*.ts', 'playwright.config.ts'],
+    languageOptions: {
+      globals: { ...globals.browser, ...globals.node },
+    },
+    rules: {
+      'react-hooks/rules-of-hooks': 'off',
+    },
+  },
 )

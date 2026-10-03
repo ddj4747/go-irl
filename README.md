@@ -15,6 +15,15 @@
 - **Real-time Health Monitoring**: Get a clear, visual overview of your stream's performance with live statistics displayed directly in OBS. In server/client mode, the VPS forwards the mobile-to-VPS SRT statistics to the local client over a dedicated encrypted telemetry stream.
 - **Flexible Deployment Options**: Supports standalone mode for simple setups and a VPN-free server/client mode for networks where home port forwarding is not possible. The local client initiates its SRT connection to a public VPS, so it also works behind typical NAT and CGNAT connections.
 
+## Terminal UI
+
+When started from a terminal, `go-irl` opens an interactive terminal UI:
+
+- **Setup screen**: shown when no flags are given (for example when double-clicking the executable). Choose the mode, ports and passphrase, then select **Start**. If the flags you passed are invalid, the setup screen opens with the error shown.
+- **Dashboard**: shows the addresses to enter in OBS and your mobile app, live bitrate / RTT / packet loss, connected SRTLA links, and the log. It also shows the equivalent command line so you can skip the setup screen next time. Press `q` to quit.
+
+Pass `-cli` to use the plain log output instead. The plain output is also used automatically when `go-irl` is not attached to a terminal (for example under systemd or when output is redirected to a file).
+
 ## Command Line Options
 
 The `go-irl` application supports several command line options to customize its behavior:
@@ -51,7 +60,13 @@ The `go-irl` application supports several command line options to customize its 
   Optional SRT stream ID. When set, configure the same `streamid` value in the mobile SRTLA URL and pass the flag to both the server and client in server/client mode. Connections with a different stream ID are rejected.
 
 - **`-passphrase`** (default: `""`)  
-  Optional passphrase for SRT encryption. In server/client mode, configure the same passphrase on the mobile sender, server, and client. Passphrases must be at least 10 characters long.
+  Passphrase for SRT encryption. Required in `server` mode (unless `-insecure` is set) and optional otherwise. In server/client mode, configure the same passphrase on the mobile sender, server, and client. Passphrases must be at least 10 characters long.
+
+- **`-insecure`** (default: `false`)  
+  Allow `server` mode to run without a passphrase. **Not recommended:** the VPS is publicly reachable, so without encryption anyone can watch your stream or publish their own stream in its place. Available in `server` mode only.
+
+- **`-cli`** (default: `false`)  
+  Use plain log output instead of the interactive terminal UI.
 
 ## Getting Started
 
@@ -191,7 +206,7 @@ Then configure your mobile app to send SRTLA to:
 srtla://203.0.113.50:5000?mode=caller&passphrase=change-this-passphrase&streamid=my-stream
 ```
 
-The client reconnects automatically if the VPS or mobile stream is temporarily unavailable. If you intentionally run without encryption, omit `-passphrase` everywhere and remove it from the mobile URL.
+The client reconnects automatically if the VPS or mobile stream is temporarily unavailable. Server mode refuses to start without `-passphrase`. If you intentionally run without encryption, start the server with `-insecure`, omit `-passphrase` everywhere, and remove it from the mobile URL. Note that anyone who can reach the VPS can then watch or replace your stream.
 
 ## Acknowledgments
 

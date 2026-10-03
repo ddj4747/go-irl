@@ -50,14 +50,18 @@ type hub struct {
 	register   chan *websocket.Conn
 	unregister chan *websocket.Conn
 	mutex      sync.RWMutex
+
+	// onMessage, if set, observes every broadcast message.
+	onMessage func([]byte)
 }
 
-func newHub() *hub {
+func newHub(onMessage func([]byte)) *hub {
 	return &hub{
 		clients:    make(map[*websocket.Conn]bool),
 		broadcast:  make(chan []byte),
 		register:   make(chan *websocket.Conn),
 		unregister: make(chan *websocket.Conn),
+		onMessage:  onMessage,
 	}
 }
 
@@ -80,6 +84,9 @@ func (h *hub) run() {
 			log.Printf("WebSocket client disconnected. Total clients: %d", len(h.clients))
 
 		case message := <-h.broadcast:
+			if h.onMessage != nil {
+				h.onMessage(message)
+			}
 			h.mutex.RLock()
 			for client := range h.clients {
 				err := client.WriteMessage(websocket.TextMessage, message)
@@ -97,6 +104,7 @@ type statsMessage struct {
 	Timestamp time.Time       `json:"timestamp"`
 	Type      string          `json:"type"` // "writer" or "reader"
 	Stats     *srt.Statistics `json:"stats"`
+	Links     []linkStats     `json:"links,omitempty"` // SRTLA links feeding the reader
 }
 
 type stats struct {
@@ -145,6 +153,7 @@ func (s *stats) reportIfDue() {
 				Timestamp: now,
 				Type:      "reader",
 				Stats:     stats,
+				Links:     srtlaLinks(),
 			}
 			if jsonData, err := json.Marshal(readerMsg); err == nil {
 				select {
@@ -181,10 +190,20 @@ func handleWebSocket(hub *hub, w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-func runSrtProxy(from string, to string, wsPort int, telemetryFrom string) <-chan error {
+// runSrtProxy forwards the SRT stream at from to the UDP address to. When
+// wsPort is set, statistics are broadcast over WebSocket and passed to
+// onStats. Startup errors are returned; after that the proxy keeps running,
+// reconnecting the SRT reader and dropping packets the UDP output rejects.
+// Write results are recorded in out (if non-nil) instead of being logged.
+func runSrtProxy(from string, to string, wsPort int, telemetryFrom string, onStats func([]byte), out *udpOutput) error {
 	var hub *hub
 	if wsPort > 0 {
-		hub = newHub()
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", wsPort))
+		if err != nil {
+			return fmt.Errorf("failed to start WebSocket server: %w", err)
+		}
+
+		hub = newHub(onStats)
 		go hub.run()
 
 		wsMux := http.NewServeMux()
@@ -192,9 +211,9 @@ func runSrtProxy(from string, to string, wsPort int, telemetryFrom string) <-cha
 			handleWebSocket(hub, w, r)
 		})
 
+		log.Printf("WebSocket server address: ws://127.0.0.1:%d/ws", wsPort)
 		go func() {
-			log.Printf("WebSocket server address: ws://127.0.0.1:%d/ws", wsPort)
-			if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", wsPort), wsMux); err != nil {
+			if err := http.Serve(ln, wsMux); err != nil {
 				log.Printf("WebSocket server error: %v", err)
 			}
 		}()
@@ -204,12 +223,9 @@ func runSrtProxy(from string, to string, wsPort int, telemetryFrom string) <-cha
 		go runStatsTelemetry(telemetryFrom, hub)
 	}
 
-	doneChan := make(chan error, 1)
-
 	w, err := openUDPWriter(to)
 	if err != nil {
-		doneChan <- fmt.Errorf("to: %w", err)
-		return doneChan
+		return fmt.Errorf("to: %w", err)
 	}
 
 	go func() {
@@ -246,17 +262,69 @@ func runSrtProxy(from string, to string, wsPort int, telemetryFrom string) <-cha
 					break
 				}
 
-				if _, err := w.Write(buffer[:n]); err != nil {
-					r.Close()
-					doneChan <- fmt.Errorf("write: %w", err)
-					return
-				}
+				// UDP output is best effort: while nothing listens on the
+				// port (e.g. the player is not running yet) writes fail with
+				// "connection refused", so drop the packet and carry on.
+				// The state is shown in the TUI rather than logged.
+				_, err = w.Write(buffer[:n])
+				out.record(time.Now(), err)
 				s.reportIfDue()
 			}
 		}
 	}()
 
-	return doneChan
+	return nil
+}
+
+// udpOutput tracks the results of writes to the UDP downstream.
+// A nil *udpOutput ignores records.
+type udpOutput struct {
+	mu   sync.Mutex
+	snap udpOutputSnapshot
+}
+
+type udpOutputSnapshot struct {
+	LastOK  time.Time // last successful write
+	LastErr time.Time // last failed write
+	Err     string    // error of the last failed write
+}
+
+// udpOutputErrorHold is how long a write error keeps the output marked as
+// failing. With nothing listening, writes alternate between success and
+// "connection refused" (the ICMP error surfaces on the next write), so a single
+// successful write does not mean the output recovered.
+const udpOutputErrorHold = 2 * time.Second
+
+func (o *udpOutput) record(at time.Time, err error) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err != nil {
+		o.snap.LastErr = at
+		o.snap.Err = err.Error()
+	} else {
+		o.snap.LastOK = at
+	}
+}
+
+func (o *udpOutput) snapshot() udpOutputSnapshot {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.snap
+}
+
+// srtPeerIdleTimeout is how long an SRT connection survives without hearing
+// from the peer. gosrt's default (2s) drops the stream on brief outages that
+// mobile senders (libsrt default: 5s) ride out, forcing a full reconnect.
+const srtPeerIdleTimeout = 5 * time.Second
+
+// newSRTConfig returns gosrt's default config with go-irl's overrides.
+func newSRTConfig() srt.Config {
+	config := srt.DefaultConfig()
+	config.PeerIdleTimeout = srtPeerIdleTimeout
+	return config
 }
 
 func openSrtStream(addr string) (io.ReadCloser, error) {
@@ -265,7 +333,7 @@ func openSrtStream(addr string) (io.ReadCloser, error) {
 		return nil, err
 	}
 
-	config := srt.DefaultConfig()
+	config := newSRTConfig()
 	if err := config.UnmarshalQuery(u.RawQuery); err != nil {
 		return nil, err
 	}

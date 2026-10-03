@@ -1,14 +1,18 @@
 import { useState, useEffect, useRef } from "react";
 import { WebSocketMessageSchema } from "./types";
-import { z } from "zod";
+import { type StatsMessage, type StatsSample, toSample } from "./stats";
+import {
+  type ConnectionQuality,
+  RETRANS_RATE_HISTORY_SIZE,
+  nextConnectionQuality,
+} from "./connectionQuality";
 
-const MAX_MESSAGES = 3000;
+// Stats arrive about once per second; keep a bit more than the graph window.
+const MAX_SAMPLES = 120;
 const CONNECTION_WAIT_TIME = 5000;
-const LOSS_RATE_HISTORY_SIZE = 3;
-const HIGH_LOSS_RATE_THRESHOLD = 20;
-const LOW_LOSS_RATE_THRESHOLD = 5;
 const RECONNECT_DELAY = 1000;
-const MESSAGE_INTERVAL = 32;
+// Re-render periodically so disconnection is detected even without messages.
+const TICK_INTERVAL = 500;
 
 export function useWebSocket({
   url,
@@ -23,15 +27,19 @@ export function useWebSocket({
   onPoorConnection?: () => void;
   onGoodConnection?: () => void;
 }) {
-  const [messages, setMessages] = useState<
-    (z.infer<typeof WebSocketMessageSchema> | null)[]
-  >(Array.from({ length: MAX_MESSAGES }, () => null));
+  const [samples, setSamples] = useState<StatsSample[]>([]);
+  const [, setTick] = useState(0);
   const socket = useRef<WebSocket | null>(null);
   const lastReceivedTime = useRef<number>(0);
   const previousConnectionState = useRef<boolean | null>(null);
+  // Rates are derived from the accumulated counters of consecutive messages.
+  const previousMessage = useRef<StatsMessage | null>(null);
 
-  const lossRateHistory = useRef<number[]>([]);
-  const connectionQualityRef = useRef<"good" | "poor">("good");
+  const retransRateHistory = useRef<number[]>([]);
+  // "unknown" until enough samples arrive after (re)connecting. Scene
+  // switching to online only happens via a transition to "good", so a
+  // reconnect with a still-lossy link does not flip back to the online scene.
+  const connectionQualityRef = useRef<ConnectionQuality>("unknown");
 
   const connect = () => {
     if (socket.current) {
@@ -42,49 +50,57 @@ export function useWebSocket({
     socket.current.addEventListener("close", handleClose);
   };
 
+  const updateConnectionQuality = (retransRate: number) => {
+    retransRateHistory.current.push(retransRate);
+    if (retransRateHistory.current.length > RETRANS_RATE_HISTORY_SIZE) {
+      retransRateHistory.current.shift();
+    }
+
+    const next = nextConnectionQuality(
+      connectionQualityRef.current,
+      retransRateHistory.current
+    );
+    if (next === connectionQualityRef.current) {
+      return;
+    }
+    connectionQualityRef.current = next;
+    if (next === "poor") {
+      onPoorConnection?.();
+    } else if (next === "good") {
+      onGoodConnection?.();
+    }
+  };
+
   const handleMessage = (event: MessageEvent) => {
-    setMessages((prev) => {
-      const data = JSON.parse(event.data);
-      const parsed = WebSocketMessageSchema.safeParse(data);
-      if (!parsed.success) {
-        console.error(parsed.error.errors);
-        return prev;
-      }
-      if (parsed.data.type !== "reader") {
-        // Ignore non-reader messages
-        return prev;
-      }
+    let data: unknown;
+    try {
+      data = JSON.parse(event.data);
+    } catch (e) {
+      console.error(e);
+      return;
+    }
+    const parsed = WebSocketMessageSchema.safeParse(data);
+    if (!parsed.success) {
+      console.error(parsed.error.errors);
+      return;
+    }
+    if (parsed.data.type !== "reader") {
+      // Ignore non-reader messages
+      return;
+    }
 
-      const lossRate = parsed.data.stats?.Instantaneous?.PktRecvLossRate;
-      if (typeof lossRate === "number") {
-        lossRateHistory.current.push(lossRate);
-        if (lossRateHistory.current.length > LOSS_RATE_HISTORY_SIZE) {
-          lossRateHistory.current.shift();
-        }
+    const now = Date.now();
+    const sample = toSample(parsed.data, previousMessage.current, now);
+    previousMessage.current = parsed.data;
+    if (sample.retransRate !== null) {
+      updateConnectionQuality(sample.retransRate);
+    }
 
-        if (lossRateHistory.current.length === LOSS_RATE_HISTORY_SIZE) {
-          const allHighLoss = lossRateHistory.current.every(
-            (rate) => rate >= HIGH_LOSS_RATE_THRESHOLD
-          );
-          const allLowLoss = lossRateHistory.current.every(
-            (rate) => rate < LOW_LOSS_RATE_THRESHOLD
-          );
+    lastReceivedTime.current = now;
 
-          if (connectionQualityRef.current === "good" && allHighLoss) {
-            connectionQualityRef.current = "poor";
-            onPoorConnection?.();
-          } else if (connectionQualityRef.current === "poor" && allLowLoss) {
-            connectionQualityRef.current = "good";
-            onGoodConnection?.();
-          }
-        }
-      }
-
-      const now = Date.now();
-      lastReceivedTime.current = now;
-
-      const next = [...prev, parsed.data];
-      if (next.length > MAX_MESSAGES) next.shift();
+    setSamples((prev) => {
+      const next = [...prev, sample];
+      if (next.length > MAX_SAMPLES) next.shift();
       return next;
     });
   };
@@ -98,12 +114,8 @@ export function useWebSocket({
 
   useEffect(() => {
     const intervalId = setInterval(() => {
-      setMessages((prev) => {
-        const next = [...prev, null];
-        if (next.length > MAX_MESSAGES) next.shift();
-        return next;
-      });
-    }, MESSAGE_INTERVAL);
+      setTick((tick) => tick + 1);
+    }, TICK_INTERVAL);
 
     return () => clearInterval(intervalId);
   }, []);
@@ -127,6 +139,10 @@ export function useWebSocket({
         previousConnectionState.current === false &&
         currentDisconnectedState === true
       ) {
+        // Stale samples must not decide the scene after reconnecting.
+        retransRateHistory.current = [];
+        previousMessage.current = null;
+        connectionQualityRef.current = "unknown";
         onDisconnected?.();
       } else if (
         previousConnectionState.current === true &&
@@ -145,5 +161,5 @@ export function useWebSocket({
     onGoodConnection,
   ]);
 
-  return { messages, isDisconnected };
+  return { samples, isDisconnected };
 }
