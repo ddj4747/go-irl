@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
-    "strings"
 
 	srt "github.com/datarhei/gosrt"
 )
@@ -22,6 +22,8 @@ const (
 // A new pub/sub generation is created whenever the publisher disconnects so a
 // mobile stream can reconnect without restarting the process.
 type srtRelay struct {
+	shared        *sharedClient
+	logMessage    func(string)
 	passphrase    string
 	streamID      string
 	mediaStreamID string
@@ -36,6 +38,14 @@ type srtRelay struct {
 	statsClients    int
 }
 
+func (r *srtRelay) logf(format string, args ...any) {
+	if r.logMessage != nil {
+		r.logMessage(fmt.Sprintf(format, args...))
+		return
+	}
+	log.Printf(format, args...)
+}
+
 type relaySnapshot struct {
 	PublisherAddr string // empty when no publisher is connected
 	Stats         *srt.Statistics
@@ -45,6 +55,10 @@ type relaySnapshot struct {
 
 // snapshot reports the relay's current publisher and client counts.
 func (r *srtRelay) snapshot() relaySnapshot {
+	if r.shared != nil {
+		snapshot, _ := r.shared.snapshot()
+		return snapshot
+	}
 	r.mu.Lock()
 	snap := relaySnapshot{Subscribers: r.subscribers, StatsClients: r.statsClients}
 	publisher := r.publisher
@@ -94,14 +108,16 @@ func (r *srtRelay) handleConnect(req srt.ConnRequest) srt.ConnType {
 	switch {
 	case id == r.mediaStreamID || id == r.statsStreamID:
 		mode = srt.SUBSCRIBE
+	case r.streamID != "" && id == r.streamID && isLoopbackAddr(req.RemoteAddr()):
+		mode = srt.PUBLISH
 	case strings.HasSuffix(id, "-client") || strings.HasSuffix(id, "-stats"):
-		log.Printf("Rejected SRT connection from %s: stream ID %q does not match %q / %q",
+		r.logf("Rejected SRT connection from %s: stream ID %q does not match %q / %q",
 			req.RemoteAddr(), id, r.mediaStreamID, r.statsStreamID)
 	case isLoopbackAddr(req.RemoteAddr()) && (r.streamID == "" || id == r.streamID):
 		mode = srt.PUBLISH
 	}
 	if mode == srt.REJECT || !r.authorize(req) {
-		log.Printf("Rejected SRT connection from %s", req.RemoteAddr())
+		r.logf("Rejected SRT connection from %s", req.RemoteAddr())
 		return srt.REJECT
 	}
 	return mode
@@ -121,7 +137,7 @@ func (r *srtRelay) handlePublish(conn srt.Conn) {
 	r.mu.Lock()
 	if r.publisherActive {
 		r.mu.Unlock()
-		log.Printf("Rejected additional SRT publisher from %s", conn.RemoteAddr())
+		r.logf("Rejected additional SRT publisher from %s", conn.RemoteAddr())
 		_ = conn.Close()
 		return
 	}
@@ -131,11 +147,11 @@ func (r *srtRelay) handlePublish(conn srt.Conn) {
 	r.publisherGen++
 	r.mu.Unlock()
 
-	log.Printf("SRTLA stream connected to relay from %s", conn.RemoteAddr())
+	r.logf("SRTLA stream connected to relay from %s", conn.RemoteAddr())
 	err := channel.Publish(conn)
 	_ = conn.Close()
 	if err != nil {
-		log.Printf("SRTLA stream disconnected from relay: %v", err)
+		r.logf("SRTLA stream disconnected from relay: %v", err)
 	}
 
 	r.mu.Lock()
@@ -160,23 +176,23 @@ func (r *srtRelay) handleSubscribe(conn srt.Conn) {
 	channel := r.channel
 	r.mu.Unlock()
 
-	log.Printf("Downstream client connected from %s", conn.RemoteAddr())
+	r.logf("Downstream client connected from %s", conn.RemoteAddr())
 	r.addClients(&r.subscribers, 1)
 	defer r.addClients(&r.subscribers, -1)
 	err := channel.Subscribe(conn)
 	_ = conn.Close()
 	if err != nil {
-		log.Printf("Downstream client disconnected: %v", err)
+		r.logf("Downstream client disconnected: %v", err)
 	}
 }
 
 func (r *srtRelay) handleStatsSubscribe(conn srt.Conn) {
-	log.Printf("Statistics client connected from %s", conn.RemoteAddr())
+	r.logf("Statistics client connected from %s", conn.RemoteAddr())
 	r.addClients(&r.statsClients, 1)
 	defer r.addClients(&r.statsClients, -1)
 	defer func() {
 		_ = conn.Close()
-		log.Printf("Statistics client disconnected from %s", conn.RemoteAddr())
+		r.logf("Statistics client disconnected from %s", conn.RemoteAddr())
 	}()
 
 	ticker := time.NewTicker(time.Second)
@@ -209,18 +225,18 @@ func (r *srtRelay) handleStatsSubscribe(conn srt.Conn) {
 				Timestamp: time.Now(),
 				Type:      "reader",
 				Stats:     statistics,
-				Links:     srtlaLinks(),
+				Links:     srtlaLinksForPublisher(publisher.RemoteAddr()),
 			}
 			var err error
 			payload, err = json.Marshal(message)
 			if err != nil {
-				log.Printf("Failed to encode upstream SRT statistics: %v", err)
+				r.logf("Failed to encode upstream SRT statistics: %v", err)
 				return
 			}
 		}
 
 		if err := writeTelemetryFrame(conn, payload); err != nil {
-			log.Printf("Failed to send upstream SRT statistics: %v", err)
+			r.logf("Failed to send upstream SRT statistics: %v", err)
 			return
 		}
 	}

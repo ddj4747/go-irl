@@ -182,6 +182,15 @@ Use server/client mode when you cannot open ports on your home network. The mobi
 
 The client opens separate media and statistics connections to the same VPS SRT port. The statistics shown in OBS—including RTT, bitrate, and packet-loss-based scene switching—come from the mobile-to-VPS SRT connection rather than the usually clean VPS-to-home connection. No additional telemetry port is required.
 
+Multiple `server` processes on the same machine can share both UDP ports. Give each process a distinct, nonempty `-streamId`; use that ID and the matching passphrase on its mobile sender and client. For example:
+
+```bash
+./go-irl -mode=server -srtla-port=5000 -srt-port=5001 -streamId=alice -passphrase=alice-secret-passphrase
+./go-irl -mode=server -srtla-port=5000 -srt-port=5001 -streamId=bob -passphrase=bob-secret-passphrase
+```
+
+The processes automatically use a shared local listener. It remains active while any registered server process is running, and it closes shortly after the last process exits. All processes sharing a listener must use the same pair of ports. IDs must also be distinct from the other streams' derived client and statistics IDs (the stream ID followed by `-client` or `-stats`). An empty ID remains supported for a single default stream, but named IDs are recommended when sharing ports. The listener uses TCP on `127.0.0.1` at the SRT port for local coordination; this TCP port must be free and does not need to be opened in the firewall.
+
 ### Setup
 
 Assuming your VPS has the public IP `203.0.113.50`:

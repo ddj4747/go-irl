@@ -676,6 +676,48 @@ func srtlaLinks() []linkStats {
 	return links
 }
 
+// srtlaLinksForPublisher restricts telemetry to the SRTLA group whose local
+// forwarding socket is connected to this publisher.
+func srtlaLinksForPublisher(addr net.Addr) []linkStats {
+	if addr == nil {
+		return nil
+	}
+	groupsMu.RLock()
+	defer groupsMu.RUnlock()
+	var links []linkStats
+	for _, g := range groups {
+		g.mu.Lock()
+		if g.srtSock != nil && g.srtSock.LocalAddr().String() == addr.String() {
+			for _, c := range g.conns {
+				links = append(links, linkStats{ID: c.id, RxBytes: c.rxBytes.Load()})
+			}
+		}
+		g.mu.Unlock()
+	}
+	return links
+}
+
+func srtlaSnapshotForPublisher(addr net.Addr) []srtlaGroupInfo {
+	if addr == nil {
+		return nil
+	}
+	groupsMu.RLock()
+	defer groupsMu.RUnlock()
+	var result []srtlaGroupInfo
+	for _, g := range groups {
+		g.mu.Lock()
+		if g.srtSock != nil && g.srtSock.LocalAddr().String() == addr.String() {
+			info := srtlaGroupInfo{CreatedAt: g.createdAt}
+			for _, c := range g.conns {
+				info.Conns = append(info.Conns, srtlaConnInfo{ID: c.id, Addr: c.addr.String(), LastRcvd: time.Unix(0, c.lastRcvd.Load()), RxBytes: c.rxBytes.Load()})
+			}
+			result = append(result, info)
+		}
+		g.mu.Unlock()
+	}
+	return result
+}
+
 // removeGroup deletes the group from global slice and closes its SRT socket.
 func removeGroup(g *Group) {
 	g.close()

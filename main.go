@@ -77,6 +77,18 @@ func makeSRTURL(host string, port int, mode, passphrase, streamID string) string
 }
 
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "--internal-shared-broker" {
+		srtlaPort, err1 := strconv.Atoi(os.Args[2])
+		srtPort, err2 := strconv.Atoi(os.Args[3])
+		if err1 != nil || err2 != nil || !validPort(srtlaPort) || !validPort(srtPort) {
+			os.Exit(1)
+		}
+		if err := runSharedBroker(srtlaPort, srtPort); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	flag.Parse()
 	cfg := configFromFlags()
 
@@ -133,37 +145,7 @@ func runMode(ctx context.Context, cfg config, hooks runHooks) error {
 }
 
 func runServerMode(ctx context.Context, cfg config, hooks runHooks) error {
-	relay := newSRTRelay(cfg.Passphrase, cfg.StreamID)
-	relayAddr := net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.SRTPort))
-	relayServer, err := relay.newServer(relayAddr)
-	if err != nil {
-		return err
-	}
-	defer relayServer.Shutdown()
-	if hooks.onRelay != nil {
-		hooks.onRelay(relay)
-	}
-
-	log.Printf("[server mode] SRTLA input UDP :%d  Downstream SRT UDP :%d", cfg.SRTLAPort, cfg.SRTPort)
-
-	relayDone := make(chan error, 1)
-	go func() {
-		relayDone <- relayServer.Serve()
-	}()
-	if err := startSrtla(uint(cfg.SRTLAPort), "127.0.0.1", uint(cfg.SRTPort), cfg.Verbose); err != nil {
-		return err
-	}
-
-	select {
-	case err := <-relayDone:
-		if err != nil {
-			return fmt.Errorf("SRT relay exited: %w", err)
-		}
-		log.Println("SRT relay exited gracefully.")
-	case <-ctx.Done():
-		log.Println("Shutdown signal received, exiting.")
-	}
-	return nil
+	return runSharedServer(ctx, cfg, hooks)
 }
 
 func runClientMode(ctx context.Context, cfg config, hooks runHooks) error {

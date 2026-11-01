@@ -163,7 +163,12 @@ func pollCmd(b *tuiBridge) tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		msg := pollMsg{at: t, groups: srtlaSnapshot(), output: b.output.snapshot()}
 		if r := b.relay.Load(); r != nil {
-			snap := r.snapshot()
+			var snap relaySnapshot
+			if r.shared != nil {
+				snap, msg.groups = r.shared.snapshot()
+			} else {
+				snap = r.snapshot()
+			}
 			msg.relay = &snap
 		}
 		return msg

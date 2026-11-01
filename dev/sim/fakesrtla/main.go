@@ -16,12 +16,9 @@ import (
 	"log"
 	mrand "math/rand"
 	"net"
-	"os"
-	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -95,18 +92,7 @@ func main() {
 		s.links[0].loss.Store(uint64(*loss * 1000))
 	}
 
-	// `kill -USR1 <pid>` takes every link down for -outage.
-	usr1 := make(chan os.Signal, 1)
-	signal.Notify(usr1, syscall.SIGUSR1)
-	go func() {
-		for range usr1 {
-			log.Printf("SIGUSR1: ALL LINKS DOWN for %s", *outage)
-			s.allDown.Store(true)
-			time.Sleep(*outage)
-			s.allDown.Store(false)
-			log.Printf("SIGUSR1: all links restored")
-		}
-	}()
+	setupOutageSignal(s, *outage)
 
 	log.Printf("send SRT (caller) to srt://%s", *listen)
 	buf := make([]byte, 1500)
